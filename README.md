@@ -31,7 +31,7 @@ Commercial noise cancellation tools often charge monthly subscriptions, drain yo
 | Feature | **Getsu** | **Krisp** | **NVIDIA Broadcast** |
 |---|:---:|:---:|:---:|
 | **Price** | **100% Free Forever** | $96 / year (or 60 min limit) | Free (Requires RTX GPU) |
-| **Requirements** | **Any PC or Laptop (CPU only)** | Any PC | Expensive RTX Graphics Card |
+| **Requirements** | **Any PC or Laptop** | Any PC | Expensive RTX Graphics Card |
 | **Privacy** | **100% Offline (Zero accounts/tracking)** | Online accounts required | Telemetry bundled |
 | **Download Size** | **~35 MB** | >150 MB | >1,000 MB (1 GB+) |
 | **Gaming Friendly** | **Near-zero latency (won't drop game FPS)** | High memory usage | Heavy GPU VRAM usage |
