@@ -34,7 +34,7 @@ from src.devices import (
     auto_select_output_device,
     get_physical_output_device,
     install_vbcable_driver,
-    get_all_devices,
+    is_laptop_microphone,
     find_matching_cable_input,
 )
 from src.config import load_config, save_config
@@ -44,13 +44,11 @@ from src.rnnoise import RNNoise, FRAME_SIZE, SAMPLE_RATE
 from src.dsp import (
     HighPassFilter,
     AdaptiveNoiseGate,
-    soft_limit,
-    calculate_levels,
     SpeechLeveler,
     TransientSuppressor,
     process_mono_frame,
 )
-from src.host_api_resolver import resolve_single, DeviceResolutionError, selection_hint
+from src.host_api_resolver import resolve_single, selection_hint
 from src.audio_errors import explain_start_error
 
 
@@ -312,10 +310,10 @@ class GetsuGUI:
         dev_name = ""
         try:
             if self.selected_input_idx is not None and self.selected_input_idx >= 0:
-                dev_name = sd.query_devices(self.selected_input_idx)['name'].lower()
+                dev_name = sd.query_devices(self.selected_input_idx)['name']
         except Exception:
             pass
-        is_laptop_mic = any(k in dev_name for k in ["realtek", "array", "built-in", "internal"])
+        is_laptop_mic = is_laptop_microphone(dev_name, self.selected_input_idx)
         base_gain = 1.2 if is_laptop_mic else 1.0
         boost_mult = 10.0 ** (self.mic_boost_db / 20.0)
         return base_gain * boost_mult
@@ -537,27 +535,49 @@ class GetsuGUI:
 
                 # Seamlessly restart stream if it was running before
                 if was_running and self._app_running:
-                    print(f"[HARDWARE] Resuming stream on [{self.selected_input_idx}] {self.selected_input_name} -> [{self.selected_output_idx}] {self.selected_output_name}")
-                    try:
-                        self.engine = create_engine_from_config(
-                            self.config,
-                            self.selected_input_idx,
-                            self.selected_output_idx,
-                            router=self.router,
-                        )
-                        self.engine.start()
-                        self.is_running = True
-                        dpg.set_value("status_badge_text", "[ ACTIVE ]")
-                        dpg.configure_item("status_badge_text", color=[45, 215, 115])
-                        dpg.configure_item("btn_toggle", label="STOP", enabled=True)
-                        dpg.bind_item_theme("btn_toggle", self.theme_stop_btn)
-                        self.set_status_pill("● AI Filter Active • Clean Voice Routed", [45, 215, 115])
-                        self._update_tray_icon()
-                        self._set_voice_test_button_state(False)
-                    except Exception as e:
-                        print(f"[HARDWARE] Failed to restart stream after rescan: {e}")
-                        self.is_running = False
-                        self.set_status_pill(f"▲ {self._format_audio_error(e)}", [235, 75, 75])
+                    acquired = self._state_lock.acquire(timeout=4.0)
+                    if acquired:
+                        try:
+                            # Re-verify that user didn't stop the stream while rescan was running
+                            if not self._app_running:
+                                return
+                            print(f"[HARDWARE] Resuming stream on [{self.selected_input_idx}] {self.selected_input_name} -> [{self.selected_output_idx}] {self.selected_output_name}")
+                            self.engine = create_engine_from_config(
+                                self.config,
+                                self.selected_input_idx,
+                                self.selected_output_idx,
+                                router=self.router,
+                            )
+                            self.engine.start()
+                            self.is_running = True
+                            if self._ui_built and dpg.does_item_exist("status_badge_text"):
+                                dpg.set_value("status_badge_text", "[ ACTIVE ]")
+                                dpg.configure_item("status_badge_text", color=[45, 215, 115])
+                                dpg.configure_item("btn_toggle", label="STOP", enabled=True)
+                                dpg.bind_item_theme("btn_toggle", self.theme_stop_btn)
+                            self.set_status_pill("● AI Filter Active • Clean Voice Routed", [45, 215, 115])
+                            self._update_tray_icon()
+                            self._set_voice_test_button_state(False)
+                        except Exception as e:
+                            print(f"[HARDWARE] Failed to restart stream after rescan: {e}")
+                            self.is_running = False
+                            if self.engine:
+                                try:
+                                    self.engine.prepare_for_stop()
+                                except Exception:
+                                    pass
+                                self.engine = None
+                            if self._ui_built and dpg.does_item_exist("status_badge_text"):
+                                dpg.set_value("status_badge_text", "[ STOPPED ]")
+                                dpg.configure_item("status_badge_text", color=[210, 75, 75])
+                                dpg.configure_item("btn_toggle", label="START", enabled=True)
+                                dpg.bind_item_theme("btn_toggle", self.theme_start_btn)
+                            self._set_voice_test_button_state(True)
+                            self.set_status_pill(f"▲ {self._format_audio_error(e)}", [235, 75, 75])
+                        finally:
+                            self._release_state_lock()
+                    else:
+                        print("[HARDWARE] Could not acquire state lock to resume stream; aborting auto-restart.")
 
             except Exception as e:
                 print(f"[HARDWARE] Error during hardware rescan: {e}")
@@ -591,9 +611,16 @@ class GetsuGUI:
                 if self.is_vbcable_installed and matching_cable:
                     self.selected_output_idx = matching_cable['index']
                     self.selected_output_name = matching_cable['name']
+                elif self.is_vbcable_installed:
+                    target_out, _ = auto_select_output_device()
+                    if target_out:
+                        self.selected_output_idx = target_out['index']
+                        self.selected_output_name = target_out.get('name', 'Default Output')
                 print(f"[GUI] Switched microphone to: [{new_idx}] {app_data} (output: [{self.selected_output_idx}] {self.selected_output_name})")
                 self.config["input_device_name"] = app_data
                 self.config["input_device_id"] = new_idx
+                self.config["output_device_name"] = self.selected_output_name
+                self.config["output_device_id"] = self.selected_output_idx
                 save_config(self.config)
                 self._update_selection_hint(app_data)
                 self.set_status_pill(f"● Microphone selected: {clean_device_label(app_data)}", [65, 205, 130])
@@ -923,8 +950,8 @@ class GetsuGUI:
             # Instantiate DSP chain matching current settings
             boost_db = self.config.get("mic_boost_db", 0)
             boost_mult = 10.0 ** (boost_db / 20.0)
-            dev_name = in_info['name'].lower()
-            is_laptop = any(k in dev_name for k in ["realtek", "array", "built-in", "internal"])
+            dev_name = in_info.get('name', '')
+            is_laptop = is_laptop_microphone(dev_name, safe_input_idx)
             base_gain = 1.2 if is_laptop else 1.0
             test_gain = base_gain * boost_mult
             out_gain = float(self.config.get("output_gain", 1.08))
@@ -1017,7 +1044,7 @@ class GetsuGUI:
             full_audio = np.concatenate(processed_chunks, axis=0)
 
             # Phase 2: Playback 11s through primary physical speakers/headphones
-            out_dev = get_physical_output_device()
+            out_dev = get_physical_output_device(force_rescan=True)
             out_idx = out_dev['index'] if (out_dev and isinstance(out_dev, dict)) else (out_dev if isinstance(out_dev, int) else sd.default.device[1])
             try:
                 raw_devs = sd.query_devices()
@@ -1083,11 +1110,6 @@ class GetsuGUI:
         """Restores window from notification area / system tray and forces foreground focus."""
         if self._hwnd:
             force_foreground_window(self._hwnd)
-
-    def hide_to_tray(self):
-        """Hides window to Windows notification area."""
-        if self._hwnd:
-            user32.ShowWindow(self._hwnd, SW_HIDE)
 
     def _update_tray_icon(self):
         if self._tray_icon:

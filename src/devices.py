@@ -5,7 +5,7 @@ import os
 import sys
 import time
 import subprocess
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any, Union
 import sounddevice as sd
 
 
@@ -21,11 +21,23 @@ def get_all_devices(force_rescan: bool = False) -> List[Dict]:
                 print(f"[WARN] Failed to reinitialize PortAudio: {e}")
         devices = sd.query_devices()
         host_apis = sd.query_hostapis()
+        if isinstance(devices, dict):
+            devices = [devices]
         result = []
         for i, d in enumerate(devices):
+            if not isinstance(d, dict):
+                continue
             try:
-                host_api_idx = d['hostapi']
-                host_name = host_apis[host_api_idx]['name'] if isinstance(host_apis, (list, tuple)) else str(host_apis.get(host_api_idx, 'WASAPI'))
+                host_api_idx = d.get('hostapi')
+                if isinstance(host_api_idx, int) and isinstance(host_apis, (list, tuple)) and 0 <= host_api_idx < len(host_apis):
+                    host_name = host_apis[host_api_idx]['name']
+                elif isinstance(host_api_idx, str):
+                    host_name = host_api_idx
+                elif isinstance(host_apis, dict) and host_api_idx in host_apis:
+                    host_val = host_apis[host_api_idx]
+                    host_name = host_val['name'] if isinstance(host_val, dict) else str(host_val)
+                else:
+                    host_name = 'WASAPI'
             except Exception:
                 host_name = 'WASAPI'
 
@@ -36,11 +48,11 @@ def get_all_devices(force_rescan: bool = False) -> List[Dict]:
 
             result.append({
                 'index': i,
-                'name': d['name'],
+                'name': d.get('name', f'Device #{i}'),
                 'hostapi': host_name,
-                'inputs': d['max_input_channels'],
-                'outputs': d['max_output_channels'],
-                'samplerate': d['default_samplerate'],
+                'inputs': d.get('max_input_channels', 0),
+                'outputs': d.get('max_output_channels', 0),
+                'samplerate': d.get('default_samplerate', 48000.0),
             })
         return result
     except Exception as e:
@@ -84,8 +96,19 @@ VIRTUAL_INPUT_BLACKLIST = [
 
 def is_virtual_input_device(name: str) -> bool:
     """Detects whether an input device is a virtual cable bridge rather than a physical microphone."""
+    if not name:
+        return False
     name_lower = name.lower()
-    return any(keyword in name_lower for keyword in VIRTUAL_INPUT_BLACKLIST)
+    if any(keyword in name_lower for keyword in VIRTUAL_INPUT_BLACKLIST):
+        return True
+    try:
+        from src.router import native_get_device_bus_type, DeviceBusType
+        bus = native_get_device_bus_type(name, is_input=True)
+        if bus == DeviceBusType.VIRTUAL:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_input_devices(include_virtual: bool = False) -> List[Dict]:
@@ -232,8 +255,22 @@ OUTPUT_HEADPHONE_KEYWORDS = [
 ]
 
 
-def is_laptop_microphone(device_name: str) -> bool:
-    """Detects whether a microphone is an integrated laptop array/realtek mic requiring gain compensation."""
+def is_laptop_microphone(device_name: str, device_id: Optional[Any] = None) -> bool:
+    """
+    Detects whether a microphone is an integrated motherboard/laptop chipset (Realtek/Intel HD).
+    Uses hardware bus enumerator (HDAUDIO/INTELAUDIO) first, with fallback to localized name strings.
+    """
+    if not device_name:
+        return False
+    try:
+        from src.router import native_get_device_bus_type, DeviceBusType
+        bus = native_get_device_bus_type(str(device_id) if device_id is not None else device_name, is_input=True)
+        if bus in (DeviceBusType.INTERNAL_HD, DeviceBusType.INTEL_AUDIO):
+            return True
+        if bus in (DeviceBusType.BLUETOOTH_HFP, DeviceBusType.BLUETOOTH_LE, DeviceBusType.USB):
+            return False
+    except Exception:
+        pass
     name_lower = device_name.lower()
     return any(k in name_lower for k in ["realtek", "array", "built-in", "internal"])
 
@@ -314,7 +351,7 @@ def auto_select_output_device() -> Tuple[Dict, str]:
     """
     Select best output device:
     - If VB-Cable is installed: Select 'CABLE Input' (Bridge Mode).
-    - If VB-Cable NOT installed: Select default headphones/speakers (Monitor/Pass-through Mode).
+    - If VB-Cable NOT installed: Select active physical headphones/speakers (Monitor/Pass-through Mode).
     Returns (device_dict, mode_str).
     """
     is_vbcable, cable_in, _ = check_vbcable_status()
@@ -322,68 +359,70 @@ def auto_select_output_device() -> Tuple[Dict, str]:
         return cable_in, "VB-Cable Bridge (Ready for Steam/Zoom)"
 
     # Fallback: Headphone/Speaker monitor mode
-    outputs = get_output_devices()
-    default_out_idx = sd.default.device[1]
-    
-    # Check default output
-    for d in outputs:
-        if d['index'] == default_out_idx:
-            return d, "Headphone Monitor Pass-Through (Local Test)"
-            
-    # Check for headphones / speakers
-    for d in outputs:
-        name_lower = d['name'].lower()
-        if any(k in name_lower for k in OUTPUT_HEADPHONE_KEYWORDS):
-            return d, "Headphone Monitor Pass-Through (Local Test)"
+    phys = get_physical_output_device()
+    if phys:
+        return phys, "Headphone Monitor Pass-Through (Local Test)"
 
+    outputs = get_output_devices()
     return outputs[0] if outputs else {'index': 0, 'name': 'Default Output'}, "Monitor Mode"
 
 
-def get_physical_output_device() -> Optional[Dict]:
+def get_physical_output_device(force_rescan: bool = False) -> Optional[Dict]:
     """
     Returns the user's active physical playback device (headphones/speakers),
     strictly excluding virtual cables (CABLE Input, VoiceMeeter, etc.).
-    Priority 1: Windows active default WASAPI playback endpoint.
-    Priority 2: Physical outputs matching Windows default device name.
-    Priority 3: Dedicated gaming headsets/headphones over onboard motherboard speakers.
+    Priority 1: Native Windows active default playback endpoint from CoreAudio.
+    Priority 2: Hardware bus priority (Bluetooth Stereo BTHENUM or USB over HDAUDIO).
+    Priority 3: Keyword preference for headphones/headsets over onboard speakers.
+    Priority 4: Fallback to first physical output.
     """
+    if force_rescan:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+
     outputs = get_output_devices()
     physical_outputs = [d for d in outputs if not is_virtual_input_device(d['name'])]
     if not physical_outputs:
         return None
 
-    # Priority 1: Windows active default WASAPI playback endpoint
+    # Priority 1: Match active Windows default playback endpoint from CoreAudio
     try:
-        hostapis = sd.query_hostapis()
-        for api in hostapis:
-            if 'WASAPI' in api.get('name', ''):
-                def_out = api.get('default_output_device', -1)
-                if def_out >= 0:
-                    for d in physical_outputs:
-                        if d['index'] == def_out:
-                            return d
-    except Exception:
-        pass
-
-    # Priority 2: Match by exact default name in physical outputs
-    try:
-        def_out_idx = sd.default.device[1]
-        if def_out_idx >= 0:
-            def_dev = sd.query_devices(def_out_idx)
-            def_name = def_dev.get('name', '').lower()
+        from src.router import native_get_current_default_playback
+        guid, win_name = native_get_current_default_playback()
+        if win_name and win_name != "Unknown" and not is_virtual_input_device(win_name):
+            win_name_lower = win_name.lower().strip()
             for d in physical_outputs:
-                if d['name'].lower() == def_name or d['index'] == def_out_idx:
+                d_name = d['name'].lower().strip()
+                if win_name_lower in d_name or d_name in win_name_lower:
                     return d
     except Exception:
         pass
 
-    # Priority 3: Prioritize headphones/headsets over onboard speakers
-    headphone_keywords = ["headset", "headphones", "mpow", "wireless", "usb", "hyperx", "razer", "logitech", "corsair", "steelseries", "jbl", "sennheiser"]
+    # Priority 2: Hardware bus priority (BTHENUM or USB headset over HDAUDIO)
+    try:
+        from src.router import native_get_device_bus_type, DeviceBusType
+        for d in physical_outputs:
+            bus = native_get_device_bus_type(d['name'], is_input=False)
+            if bus in (DeviceBusType.BLUETOOTH_A2DP, DeviceBusType.BLUETOOTH_LE, DeviceBusType.USB):
+                return d
+    except Exception:
+        pass
+
+    # Priority 3: Fallback keyword preference for headphones over onboard speakers
+    headphone_keywords = [
+        "headset", "headphones", "bluetooth", "wireless", "buds", "freebuds",
+        "airpods", "wh-", "wf-", "mpow", "usb", "hyperx", "razer", "logitech",
+        "corsair", "steelseries", "jbl", "sennheiser", "soundcore"
+    ]
     for d in physical_outputs:
         name_lower = d['name'].lower()
         if any(k in name_lower for k in headphone_keywords):
             return d
 
+    # Priority 4: First physical output (e.g. onboard Realtek speakers)
     return physical_outputs[0]
 
 

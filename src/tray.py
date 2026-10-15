@@ -2,7 +2,6 @@
 System Tray User Interface for Getsu using pystray and Pillow.
 Provides real-time tray menu, status indicator icon, and quick controls.
 """
-import os
 import threading
 from typing import Optional
 from PIL import Image, ImageDraw

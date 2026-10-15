@@ -4,7 +4,7 @@ Synchronous WASAPI duplex streaming with in-flight DSP and RNNoise neural filter
 """
 import time
 import threading
-from typing import Optional, Callable, Any
+from typing import Optional, Any
 import numpy as np
 import sounddevice as sd
 
@@ -13,7 +13,6 @@ from src.dsp import (
     HighPassFilter,
     AdaptiveNoiseGate,
     calculate_levels,
-    soft_limit,
     SpeechLeveler,
     TransientSuppressor,
     process_mono_frame,
@@ -280,10 +279,25 @@ class AudioEngine:
             # Recalibrate noise gate baseline profiler before opening audio stream
             self.gate.recalibrate()
 
+            # Dynamic Bluetooth buffer adaptation: absorb 2.4GHz RF packet retries for Hands-Free Profile (HFP)
+            is_bluetooth = False
+            try:
+                from src.router import native_get_device_bus_type, DeviceBusType
+                in_dev_name = in_dev_info.get('name', '') if isinstance(in_dev_info, dict) else ''
+                in_bus = native_get_device_bus_type(str(self.input_device) if self.input_device is not None else in_dev_name, is_input=True)
+                is_bluetooth = (in_bus == DeviceBusType.BLUETOOTH_HFP)
+            except Exception:
+                is_bluetooth = False
+
+            latency_setting = 0.035 if is_bluetooth else 'low'
+
             print(f"[STREAM] Starting low-latency stream...")
             print(f"         Input  : [{self.input_device}] {in_dev_info['name']} ({self.in_channels} ch)")
             print(f"         Output : [{self.output_device}] {out_dev_info['name']} ({self.out_channels} ch)")
-            print(f"         Blocksize: 10ms (480 samples @ 48kHz) | Est. Latency: ~45ms round-trip")
+            if is_bluetooth:
+                print(f"         Latency: Bluetooth Jitter Buffer (35ms RF smoothing)")
+            else:
+                print(f"         Blocksize: 10ms (480 samples @ 48kHz) | Est. Latency: ~45ms round-trip")
             
             last_err = None
             for attempt in range(3):
@@ -294,7 +308,7 @@ class AudioEngine:
                         device=(self.input_device, self.output_device),
                         channels=(self.in_channels, self.out_channels),
                         dtype='float32',
-                        latency='low',
+                        latency=latency_setting,
                         extra_settings=extra_settings,
                         callback=self._audio_callback
                     )

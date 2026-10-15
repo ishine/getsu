@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.1] - 2026-10-15
+
+- **Windows CoreAudio PnP Hardware Bus Auto-Detection (`PKEY_Device_EnumeratorName`)**:
+  - Implemented direct Win32 COM querying of `IMMDevice` property stores via ctypes (`PKEY_Device_EnumeratorName`, `{a45c254e-df1c-4efd-8020-67d146a850e0}`, PID 24).
+  - Categorizes audio hardware into canonical bus architectures: `BLUETOOTH_HFP` (`BTHHFENUM`), `BLUETOOTH_A2DP` (`BTHENUM`), `USB`, `INTERNAL_HD` (`HDAUDIO`), `INTEL_AUDIO` (`INTELAUDIO`), and `VIRTUAL` (VB-Audio / cable drivers).
+- **Native Active Playback Resolution**:
+  - Direct Win32 CoreAudio query of active default audio endpoints (`eRender` across `eConsole`, `eMultimedia`, and `eCommunications`), completely removing reliance on brittle MME `sd.default.device[1]` index lookups.
+  - 4-tier output resolution in `get_physical_output_device()` prioritizing active CoreAudio playback endpoint, hardware bus priority, keywords, and verified physical endpoints.
+- **Dynamic Bluetooth Hands-Free (HFP) Jitter Buffer Adaptation**:
+  - Automatically identifies Bluetooth HFP headsets (`BTHHFENUM`) and silently adapts PortAudio stream latency to `0.035s` (35ms RF packet smoothing buffer) while retaining ultra-low `low` latency (10ms) for USB and HD Audio devices.
+- **Hardware-Aware Laptop Microphone Detection**:
+  - Upgraded `is_laptop_microphone()` to inspect hardware bus enumerators (`INTERNAL_HD`, `INTEL_AUDIO`) before falling back to localized name matching.
+  - Harmonized gain compensation (1.2x) across live streaming (`_compute_current_gain`) and in-memory Voice Test preview (`_run_voice_test_worker`).
+- **Voice Test Phase 2 Live Output Rescan**:
+  - Live Voice Test preview explicitly triggers `get_physical_output_device(force_rescan=True)` immediately before playback, routing test audio to the current default output even if user plugged in headphones mid-recording.
+- **Hotplug Concurrency Synchronization & Rescan UI Error Recovery**:
+  - Added state lock acquisition with timeout in `_handle_hardware_rescan()`, preventing race conditions with `_stop_worker` from resurrecting orphaned background streams when hotplug events occur during user stop.
+  - Implemented comprehensive error recovery: if stream restart fails after hardware changes, the UI automatically resets `btn_toggle` to "START", status badge to `[ STOPPED ]`, and re-enables Voice Test rather than locking the user out.
+- **Type-Safe Device Querying & Codebase Hygiene**:
+  - Hardened `get_all_devices()` against malformed mock data, non-dict elements, and string/non-integer host API indexes.
+  - Cleaned dead code (`hide_to_tray`) and pruned unused imports across `src/gui.py`, `src/stream.py`, `src/cli_cleaner.py`, and `src/tray.py`.
+
+---
+
 ## [1.3.0] - 2026-10-10
 
 - **Dual-Binary Architecture & Batch CLI Engine (`getsu-cli.exe` & `getsu.exe`)**:

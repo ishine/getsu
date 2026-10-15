@@ -3,16 +3,13 @@ Getsu Headless Audio Cleaner & Batch CLI Processor.
 Universal format decoding via miniaudio, 48kHz resampling, sample-accurate duration trimming,
 zero-flush latency extraction, linked-stereo gating, and TPDF dithered 16-bit PCM WAV export.
 """
-import os
 import sys
 import time
-import math
 import json
-import glob
 import wave
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 import numpy as np
 import miniaudio
 

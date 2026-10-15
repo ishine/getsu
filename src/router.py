@@ -97,6 +97,23 @@ PKEY_Device_FriendlyName = PROPERTYKEY(
     14
 )
 
+# Hardware Bus Enumerator Property Key: DEVPKEY_Device_EnumeratorName
+PKEY_Device_EnumeratorName = PROPERTYKEY(
+    GUID(0xa45c254e, 0xdf1c, 0x4efd, (wintypes.BYTE * 8)(0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0)),
+    24
+)
+
+
+class DeviceBusType:
+    BLUETOOTH_HFP = "BTHHFENUM"   # Bluetooth Hands-Free Profile (Mic + Bidirectional)
+    BLUETOOTH_A2DP = "BTHENUM"    # Bluetooth High-Quality Stereo Playback
+    BLUETOOTH_LE = "BTHLEENUM"    # Windows 11 Bluetooth Low Energy (LC3)
+    USB = "USB"                   # Dedicated USB Audio / 2.4GHz Dongles
+    INTERNAL_HD = "HDAUDIO"       # High Definition Audio (Realtek / Motherboard)
+    INTEL_AUDIO = "INTELAUDIO"   # Intel Smart Sound / High Definition
+    VIRTUAL = "SWD"               # Software Virtual Drivers (VB-Audio, VoiceMeeter)
+    UNKNOWN = "UNKNOWN"
+
 # CoreAudio Device Enumerator
 CLSID_MMDeviceEnumerator = GUID(0xBCDE0395, 0xE52F, 0x467C, (wintypes.BYTE * 8)(0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E))
 IID_IMMDeviceEnumerator = GUID(0xA95664D2, 0x9614, 0x4F35, (wintypes.BYTE * 8)(0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6))
@@ -187,6 +204,195 @@ def native_get_current_default_mic() -> Tuple[Optional[str], str]:
         logger.debug(f"native_get_current_default_mic exception: {e}")
         return None, "Unknown"
     finally:
+        _release_com_ptr(pStore)
+        _release_com_ptr(pDev)
+        _release_com_ptr(pEnum)
+
+
+def native_get_current_default_playback() -> Tuple[Optional[str], str]:
+    """
+    Direct in-process query for the active Windows default playback (render) endpoint.
+    Checks eConsole (0) first, with fallback to eMultimedia (1) and eCommunications (2).
+    Returns (endpoint_guid, friendly_name).
+    """
+    if sys.platform != 'win32' or not ole32:
+        return None, "Unknown"
+
+    pEnum = None
+    pDev = None
+    pStore = None
+    try:
+        _safe_co_initialize()
+        pEnum = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(CLSID_MMDeviceEnumerator),
+            None,
+            1 | 2 | 4,  # CLSCTX_ALL
+            ctypes.byref(IID_IMMDeviceEnumerator),
+            ctypes.byref(pEnum)
+        )
+        if hr != 0 or not pEnum:
+            return None, "Unknown"
+
+        vtable = ctypes.cast(ctypes.cast(pEnum, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+        GetDefaultAudioEndpoint = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(vtable[4])
+
+        pDev = ctypes.c_void_p()
+        # eRender = 0, eConsole = 0
+        hr = GetDefaultAudioEndpoint(pEnum, 0, 0, ctypes.byref(pDev))
+        if hr != 0 or not pDev:
+            # Fallback to eMultimedia = 1
+            hr = GetDefaultAudioEndpoint(pEnum, 0, 1, ctypes.byref(pDev))
+            if hr != 0 or not pDev:
+                hr = GetDefaultAudioEndpoint(pEnum, 0, 2, ctypes.byref(pDev))
+                if hr != 0 or not pDev:
+                    return None, "Unknown"
+
+        dev_vtable = ctypes.cast(ctypes.cast(pDev, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+        OpenPropertyStore = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(dev_vtable[4])
+        GetId = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR))(dev_vtable[5])
+
+        dev_id = None
+        pStr = wintypes.LPWSTR()
+        try:
+            if GetId(pDev, ctypes.byref(pStr)) == 0 and pStr.value:
+                dev_id = str(pStr.value)
+        finally:
+            if pStr.value and ole32 and hasattr(ole32, 'CoTaskMemFree'):
+                ole32.CoTaskMemFree(pStr)
+
+        name = "Unknown"
+        pStore = ctypes.c_void_p()
+        if OpenPropertyStore(pDev, 0, ctypes.byref(pStore)) == 0 and pStore:
+            store_vtable = ctypes.cast(ctypes.cast(pStore, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+            GetValue = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(store_vtable[5])
+            pv = PROPVARIANT()
+            try:
+                if GetValue(pStore, ctypes.byref(PKEY_Device_FriendlyName), ctypes.byref(pv)) == 0:
+                    if pv.vt == 31 and pv.pwszVal:
+                        name = str(pv.pwszVal)
+            finally:
+                if ole32 and hasattr(ole32, 'PropVariantClear'):
+                    ole32.PropVariantClear(ctypes.byref(pv))
+
+        return dev_id, name
+    except Exception as e:
+        logger.debug(f"native_get_current_default_playback exception: {e}")
+        return None, "Unknown"
+    finally:
+        _release_com_ptr(pStore)
+        _release_com_ptr(pDev)
+        _release_com_ptr(pEnum)
+
+
+def native_get_device_bus_type(device_id_or_name: Optional[str] = None, is_input: bool = True) -> str:
+    """
+    Direct in-process query retrieving the hardware driver bus enumerator name (PKEY_Device_EnumeratorName).
+    Returns DeviceBusType string (e.g. 'BTHHFENUM', 'BTHENUM', 'USB', 'HDAUDIO', 'SWD') or 'UNKNOWN'.
+    """
+    if sys.platform != 'win32' or not ole32:
+        return DeviceBusType.UNKNOWN
+
+    pEnum = None
+    pDev = None
+    pStore = None
+    pCol = None
+    try:
+        _safe_co_initialize()
+        pEnum = ctypes.c_void_p()
+        if ole32.CoCreateInstance(ctypes.byref(CLSID_MMDeviceEnumerator), None, 1 | 2 | 4, ctypes.byref(IID_IMMDeviceEnumerator), ctypes.byref(pEnum)) != 0 or not pEnum:
+            return DeviceBusType.UNKNOWN
+
+        enum_vtable = ctypes.cast(ctypes.cast(pEnum, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+        dataflow = 1 if is_input else 0
+
+        # Branch 1: Specific ID (GUID or endpoint ID string)
+        if device_id_or_name and ("{" in device_id_or_name or "." in device_id_or_name):
+            GetDevice = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))(enum_vtable[5])
+            pDev = ctypes.c_void_p()
+            if GetDevice(pEnum, str(device_id_or_name), ctypes.byref(pDev)) != 0 or not pDev:
+                return DeviceBusType.UNKNOWN
+        # Branch 2: Default device if no name/ID specified
+        elif not device_id_or_name:
+            GetDefaultAudioEndpoint = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(enum_vtable[4])
+            pDev = ctypes.c_void_p()
+            if GetDefaultAudioEndpoint(pEnum, dataflow, 0, ctypes.byref(pDev)) != 0 or not pDev:
+                return DeviceBusType.UNKNOWN
+        # Branch 3: Friendly name match across active endpoints
+        else:
+            EnumAudioEndpoints = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))(enum_vtable[3])
+            pCol = ctypes.c_void_p()
+            if EnumAudioEndpoints(pEnum, dataflow, 1, ctypes.byref(pCol)) != 0 or not pCol:
+                return DeviceBusType.UNKNOWN
+            col_vtable = ctypes.cast(ctypes.cast(pCol, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+            GetCount = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT))(col_vtable[3])
+            Item = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p))(col_vtable[4])
+            count = wintypes.UINT()
+            GetCount(pCol, ctypes.byref(count))
+
+            target_name_lower = device_id_or_name.lower().strip()
+            for i in range(count.value):
+                item_dev = ctypes.c_void_p()
+                if Item(pCol, i, ctypes.byref(item_dev)) == 0 and item_dev:
+                    item_vtable = ctypes.cast(ctypes.cast(item_dev, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+                    item_OpenStore = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(item_vtable[4])
+                    item_store = ctypes.c_void_p()
+                    matched = False
+                    if item_OpenStore(item_dev, 0, ctypes.byref(item_store)) == 0 and item_store:
+                        st_vtable = ctypes.cast(ctypes.cast(item_store, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+                        st_GetValue = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(st_vtable[5])
+                        pv = PROPVARIANT()
+                        if st_GetValue(item_store, ctypes.byref(PKEY_Device_FriendlyName), ctypes.byref(pv)) == 0:
+                            if pv.vt == 31 and pv.pwszVal:
+                                dev_name = str(pv.pwszVal).lower()
+                                if target_name_lower in dev_name or dev_name in target_name_lower:
+                                    matched = True
+                        if ole32 and hasattr(ole32, 'PropVariantClear'):
+                            ole32.PropVariantClear(ctypes.byref(pv))
+                        _release_com_ptr(item_store)
+                    if matched:
+                        pDev = item_dev
+                        break
+                    _release_com_ptr(item_dev)
+
+        if not pDev:
+            return DeviceBusType.UNKNOWN
+
+        dev_vtable = ctypes.cast(ctypes.cast(pDev, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+        OpenPropertyStore = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(dev_vtable[4])
+        pStore = ctypes.c_void_p()
+        if OpenPropertyStore(pDev, 0, ctypes.byref(pStore)) == 0 and pStore:
+            store_vtable = ctypes.cast(ctypes.cast(pStore, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+            GetValue = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(store_vtable[5])
+            pv = PROPVARIANT()
+            try:
+                if GetValue(pStore, ctypes.byref(PKEY_Device_EnumeratorName), ctypes.byref(pv)) == 0:
+                    if pv.vt == 31 and pv.pwszVal:
+                        enumerator = str(pv.pwszVal).strip().upper()
+                        if "BTHHFENUM" in enumerator:
+                            return DeviceBusType.BLUETOOTH_HFP
+                        elif "BTHENUM" in enumerator:
+                            return DeviceBusType.BLUETOOTH_A2DP
+                        elif "BTHLEENUM" in enumerator:
+                            return DeviceBusType.BLUETOOTH_LE
+                        elif "USB" in enumerator:
+                            return DeviceBusType.USB
+                        elif "HDAUDIO" in enumerator:
+                            return DeviceBusType.INTERNAL_HD
+                        elif "INTELAUDIO" in enumerator:
+                            return DeviceBusType.INTEL_AUDIO
+                        elif "SWD" in enumerator:
+                            return DeviceBusType.VIRTUAL
+                        return enumerator
+            finally:
+                if ole32 and hasattr(ole32, 'PropVariantClear'):
+                    ole32.PropVariantClear(ctypes.byref(pv))
+        return DeviceBusType.UNKNOWN
+    except Exception as e:
+        logger.debug(f"native_get_device_bus_type exception: {e}")
+        return DeviceBusType.UNKNOWN
+    finally:
+        _release_com_ptr(pCol)
         _release_com_ptr(pStore)
         _release_com_ptr(pDev)
         _release_com_ptr(pEnum)
@@ -492,6 +698,23 @@ class SmartMicRouter:
             parts = out.split("|", 1)
             return parts[0].strip(), parts[1].strip()
         return None, "Unknown"
+
+    def get_current_default_playback(self) -> Tuple[Optional[str], str]:
+        """
+        Retrieves the active Windows default playback device.
+        Returns: (endpoint_guid, friendly_name)
+        """
+        guid, name = native_get_current_default_playback()
+        if guid:
+            return guid, name
+        return None, "Unknown"
+
+    def get_device_bus_type(self, device_id_or_name: Optional[str] = None, is_input: bool = True) -> str:
+        """
+        Retrieves the hardware bus enumerator for a device.
+        Returns: DeviceBusType string (e.g. 'BTHHFENUM', 'BTHENUM', 'USB', 'HDAUDIO', 'SWD').
+        """
+        return native_get_device_bus_type(device_id_or_name, is_input=is_input)
 
     def get_cable_capture_guid(self) -> Optional[str]:
         """Scans active capture endpoints for CABLE Output and returns its GUID."""
